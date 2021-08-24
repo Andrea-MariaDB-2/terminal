@@ -7,10 +7,6 @@
 
 #include <LibraryResources.h>
 
-#include "AzureCloudShellGenerator.h"
-#include "PowershellCoreProfileGenerator.h"
-#include "WslDistroGenerator.h"
-
 using namespace ::Microsoft::Terminal::Settings::Model;
 using namespace winrt::Microsoft::Terminal;
 using namespace winrt::Microsoft::Terminal::Control;
@@ -39,12 +35,6 @@ CascadiaSettings::CascadiaSettings(const bool addDynamicProfiles) :
     _warnings{ winrt::single_threaded_vector<SettingsLoadWarnings>() },
     _defaultTerminals{ winrt::single_threaded_observable_vector<Model::DefaultTerminal>() }
 {
-    if (addDynamicProfiles)
-    {
-        _profileGenerators.emplace_back(std::make_unique<PowershellCoreProfileGenerator>());
-        _profileGenerators.emplace_back(std::make_unique<WslDistroGenerator>());
-        _profileGenerators.emplace_back(std::make_unique<AzureCloudShellGenerator>());
-    }
 }
 
 CascadiaSettings::CascadiaSettings(winrt::hstring json) :

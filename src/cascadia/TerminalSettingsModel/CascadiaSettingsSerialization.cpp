@@ -8,6 +8,10 @@
 #include <shlobj.h>
 #include <til/latch.h>
 
+#include "AzureCloudShellGenerator.h"
+#include "PowershellCoreProfileGenerator.h"
+#include "WslDistroGenerator.h"
+
 // defaults.h is a file containing the default json settings in a std::string_view
 #include "defaults.h"
 #include "defaults-universal.h"
@@ -116,6 +120,107 @@ static void catchRethrowSerializationExceptionWithLocationInfo(std::string_view 
                           fmt::arg("key", e.key.value_or("")),
                           fmt::arg("message", msg));
         throw SettingsTypedDeserializationException{ msg };
+    }
+}
+
+static Json::Value parseJSON(const std::string_view& content)
+{
+    Json::Value json;
+    std::string errs;
+    const std::unique_ptr<Json::CharReader> reader{ Json::CharReaderBuilder::CharReaderBuilder().newCharReader() };
+
+    if (!reader->parse(content.data(), content.data() + content.size(), &json, &errs))
+    {
+        throw winrt::hresult_error(WEB_E_INVALID_JSON_STRING, winrt::to_hstring(errs));
+    }
+
+    return json;
+}
+
+static const Json::Value& getJSONValue(const Json::Value& json, const std::string_view& key) noexcept
+{
+    const auto found = json.find(key.data(), key.data() + key.size());
+    return found ? *found : Json::Value::nullSingleton();
+}
+
+// settings.json contains either of:
+// * {"profiles": [{...}, {...}, ...]}
+// * {"profiles": {"list": [{...}, {...}, ...]}}
+static const Json::Value& getProfilesArray(const Json::Value& json) noexcept
+{
+    const auto& profilesProperty = getJSONValue(json, ProfilesKey);
+    return profilesProperty.isArray() ? profilesProperty : getJSONValue(profilesProperty, ProfilesListKey);
+}
+
+// Function Description:
+// - Given a json serialization of a profile, this function will determine
+//   whether it is "well-formed". We introduced a bug (GH#9962, fixed in GH#9964)
+//   that would result in one or more nameless, guid-less profiles being emitted
+//   into the user's settings file. Those profiles would show up in the list as
+//   "Default" later.
+static bool isValidProfileObject(const Json::Value& profileJson)
+{
+    return profileJson.isObject() &&
+           (profileJson.isMember(NameKey.data(), NameKey.data() + NameKey.size()) || // has a name (can generate a guid)
+            profileJson.isMember(GuidKey.data(), GuidKey.data() + GuidKey.size())); // or has a guid
+}
+
+ParsedSettings::ParsedSettings(const std::string_view& content)
+{
+    const auto json = parseJSON(content);
+    globals = GlobalAppSettings::FromJson(json);
+
+    if (const auto& schemes = getJSONValue(json, SchemesKey))
+    {
+        for (const auto& schemeJson : schemes)
+        {
+            if (schemeJson.isObject() && ColorScheme::ValidateColorScheme(schemeJson))
+            {
+                globals->AddColorScheme(*ColorScheme::FromJson(schemeJson));
+            }
+        }
+    }
+
+    if (const auto& profilesObject = getJSONValue(json, ProfilesKey))
+    {
+        const auto& defaultsObject = getJSONValue(profilesObject, DefaultSettingsKey);
+        const auto& profilesArray = profilesObject.isArray() ? profilesObject : getJSONValue(profilesObject, ProfilesListKey);
+
+        if (isValidProfileObject(defaultsObject))
+        {
+            profileDefaults = Profile::FromJson(defaultsObject);
+            // Remove the `guid` member from the default settings.
+            // That'll hyper-explode, so just don't let them do that.
+            profileDefaults->ClearGuid();
+            profileDefaults->Origin(OriginTag::ProfilesDefaults);
+        }
+
+        std::unordered_map<winrt::guid, Profile*> profilesByGuid;
+        profilesByGuid.reserve(profilesArray.size());
+
+        for (auto profileJson : profilesArray)
+        {
+            if (isValidProfileObject(profileJson))
+            {
+                const auto profile = Profile::FromJson(profileJson);
+                profile->Origin(OriginTag::User);
+
+                // Love it.
+                if (!profile->HasGuid())
+                {
+                    profile->Guid(profile->Guid());
+                }
+
+                if (auto [it, ok] = profilesByGuid.emplace(profile->Guid()); !ok)
+                {
+                    it->second->LayerJson(profileJson);
+                }
+                else
+                {
+                    profiles.emplace_back(std::move(profile));
+                }
+            }
+        }
     }
 }
 
@@ -283,9 +388,12 @@ winrt::Microsoft::Terminal::Settings::Model::CascadiaSettings CascadiaSettings::
 
     try
     {
+        ParsedSettings parsed{ DefaultUniversalJson };
+
         // Create settings and get the universal defaults loaded up.
         auto resultPtr = winrt::make_self<CascadiaSettings>();
-        resultPtr->LayerJson(_ParseUtf8JsonString(DefaultUniversalJson));
+        resultPtr->_globals = parsed.globals;
+        resultPtr->_allProfiles = parsed.fuckyou1();
 
         // Now validate.
         // If this throws, the app will catch it and use the default settings
@@ -317,8 +425,12 @@ winrt::Microsoft::Terminal::Settings::Model::CascadiaSettings CascadiaSettings::
 // - a unique_ptr to a CascadiaSettings with the settings from defaults.json
 winrt::Microsoft::Terminal::Settings::Model::CascadiaSettings CascadiaSettings::LoadDefaults()
 {
-    auto resultPtr{ winrt::make_self<CascadiaSettings>() };
-    resultPtr->LayerJson(_ParseUtf8JsonString(DefaultJson));
+    ParsedSettings parsed{ DefaultJson };
+
+    const auto resultPtr{ winrt::make_self<CascadiaSettings>() };
+    resultPtr->_globals = parsed.globals;
+    resultPtr->_allProfiles = parsed.fuckyou1();
+
     resultPtr->_UpdateActiveProfiles();
     resultPtr->_ResolveDefaultProfile();
 
@@ -344,7 +456,12 @@ winrt::Microsoft::Terminal::Settings::Model::CascadiaSettings CascadiaSettings::
 // - <none>
 void CascadiaSettings::_LoadDynamicProfiles(const std::unordered_set<std::wstring>& ignoredNamespaces)
 {
-    for (const auto& generator : _profileGenerators)
+    std::vector<std::unique_ptr<IDynamicProfileGenerator>> profileGenerators;
+    profileGenerators.emplace_back(std::make_unique<PowershellCoreProfileGenerator>());
+    profileGenerators.emplace_back(std::make_unique<WslDistroGenerator>());
+    profileGenerators.emplace_back(std::make_unique<AzureCloudShellGenerator>());
+
+    for (const auto& generator : profileGenerators)
     {
         const std::wstring generatorNamespace{ generator->GetNamespace() };
 
@@ -580,7 +697,7 @@ Json::Value CascadiaSettings::_ParseUtf8JsonString(std::string_view fileData)
     const auto actualDataEnd = fileData.data() + fileData.size();
 
     std::string errs; // This string will receive any error text from failing to parse.
-    std::unique_ptr<Json::CharReader> reader{ Json::CharReaderBuilder::CharReaderBuilder().newCharReader() };
+    const std::unique_ptr<Json::CharReader> reader{ Json::CharReaderBuilder::CharReaderBuilder().newCharReader() };
 
     // `parse` will return false if it fails.
     if (!reader->parse(actualDataStart, actualDataEnd, &result, &errs))
@@ -590,18 +707,6 @@ Json::Value CascadiaSettings::_ParseUtf8JsonString(std::string_view fileData)
         throw winrt::hresult_error(WEB_E_INVALID_JSON_STRING, winrt::to_hstring(errs));
     }
     return result;
-}
-
-// Function Description:
-// - Given a json serialization of a profile, this function will determine
-//   whether it is "well-formed". We introduced a bug (GH#9962, fixed in GH#9964)
-//   that would result in one or more nameless, guid-less profiles being emitted
-//   into the user's settings file. Those profiles would show up in the list as
-//   "Default" later.
-static bool _IsValidProfileObject(const Json::Value& profileJson)
-{
-    return profileJson.isMember(NameKey.data(), NameKey.data() + NameKey.size()) || // has a name (can generate a guid)
-           profileJson.isMember(GuidKey.data(), GuidKey.data() + GuidKey.size()); // or has a guid
 }
 
 // Method Description:
@@ -646,7 +751,7 @@ void CascadiaSettings::LayerJson(const Json::Value& json)
 
     for (auto profileJson : _GetProfilesJsonObject(json))
     {
-        if (profileJson.isObject() && _IsValidProfileObject(profileJson))
+        if (profileJson.isObject() && isValidProfileObject(profileJson))
         {
             _LayerOrCreateProfile(profileJson);
         }

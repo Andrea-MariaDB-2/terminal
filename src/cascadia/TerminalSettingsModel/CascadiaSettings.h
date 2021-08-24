@@ -55,6 +55,28 @@ public:
 
 namespace winrt::Microsoft::Terminal::Settings::Model::implementation
 {
+    struct ParsedSettings
+    {
+        explicit ParsedSettings(const std::string_view& content);
+
+        winrt::Windows::Foundation::Collections::IObservableVector<Model::Profile> fuckyou1() const
+        {
+            std::vector<Model::Profile> vec;
+            vec.reserve(profiles.size());
+
+            for (const auto& p : profiles)
+            {
+                vec.emplace_back(*p);
+            }
+
+            return winrt::single_threaded_observable_vector(std::move(vec));
+        }
+
+        winrt::com_ptr<GlobalAppSettings> globals;
+        winrt::com_ptr<Profile> profileDefaults;
+        std::vector<winrt::com_ptr<Profile>> profiles;
+    };
+
     struct CascadiaSettings : CascadiaSettingsT<CascadiaSettings>
     {
     public:
@@ -115,7 +137,6 @@ namespace winrt::Microsoft::Terminal::Settings::Model::implementation
         hstring _deserializationErrorMessage;
         Windows::Foundation::Collections::IObservableVector<Model::DefaultTerminal> _defaultTerminals;
         Model::DefaultTerminal _currentDefaultTerminal{ nullptr };
-        std::vector<std::unique_ptr<::Microsoft::Terminal::Settings::Model::IDynamicProfileGenerator>> _profileGenerators;
         winrt::com_ptr<Profile> _userDefaultProfileSettings;
 
         winrt::com_ptr<Profile> _CreateNewProfile(const std::wstring_view& name) const;
